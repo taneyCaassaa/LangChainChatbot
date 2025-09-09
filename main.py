@@ -75,6 +75,9 @@ PERSON_TRIGGERS = [
     r"\bwho is\b", r"\bbiography\b", r"\bage\b", r"\bborn\b", r"\bdied\b",
     r"\bceo\b", r"\bprime minister\b", r"\bpresident\b"
 ]
+IMAGE_TRIGGERS = {
+    "image", "images", "picture", "pictures", "photo", "photos", "pic", "pics", "img"
+}
 
 def _is_current_query(t: str) -> bool:
     tl = t.lower()
@@ -83,17 +86,19 @@ def _is_current_query(t: str) -> bool:
 def _mentions_person(t: str) -> bool:
     return any(re.search(p, t, re.IGNORECASE) for p in PERSON_TRIGGERS)
 
-IMAGE_TRIGGERS = {
-    "image", "images", "picture", "pictures", "photo", "photos", "pic", "pics", "img"
-}
-
 def is_image_query(t: str) -> bool:
     tl = t.lower()
     return any(term in tl for term in IMAGE_TRIGGERS)
 
 def should_use_web_search(message: str) -> bool:
-     t = (message or "").strip().lower()
-     return True
+    t = (message or "").strip().lower()
+    if is_image_query(t):
+        return True  # Allow image searches only for explicit image queries
+    if _mentions_person(t):
+        return True  # Allow web search for bio details but not images
+    if _is_current_query(t):
+        return True  # Allow web search for recent queries
+    return False
 
 # Custom cache for time-sensitive data
 def timed_lru_cache(seconds: int):
@@ -112,6 +117,7 @@ def timed_lru_cache(seconds: int):
             wrapper.cache[cache_key] = (result, time.time())
             return result
         wrapper.cache = {}
+        wrapper.clear_cache = lambda: [wrapper.cache.clear(), cached_func.cache_clear()]
         return wrapper
     return decorator
 
@@ -137,30 +143,29 @@ class WebSearchTool(BaseTool):
                 params = {
                     "engine": "google",
                     "q": query,
-                    "tbm": "isch",
                     "api_key": SERPAPI_KEY,
                     "num": 6,
-                    "ijn": 0  # Ensure first page of results
+                    "ijn": 0
                 }
-                logger.info(f"Sending image search request for query: {query}")
+                logger.info(f"Sending web search request for query: {query}")
                 async with session.get(url, params=params, timeout=10) as response:
                     if response.status != 200:
-                        logger.error(f"Image search API returned status: {response.status} - {await response.text()}")
+                        logger.error(f"Web search API returned status: {response.status} - {await response.text()}")
                         return json.dumps([])
                     data = await response.json()
                     logger.debug(f"SerpAPI response: {json.dumps(data)[:500]}...")
-                    images = []
-                    for img in (data.get("images_results") or [])[:3]:
-                        title = img.get("title", "Untitled Image")
-                        original = img.get("original", "")
-                        thumbnail = img.get("thumbnail", original)  # Fallback to original if no thumbnail
-                        if original:
-                            images.append({"title": title, "url": original, "thumbnail": thumbnail})
-                    if not images:
-                        logger.warning(f"No valid images found for query: {query}")
-                    return json.dumps(images)
+                    results = []
+                    for item in (data.get("organic_results") or [])[:3]:
+                        title = item.get("title", "Untitled")
+                        snippet = item.get("snippet", "")
+                        link = item.get("link", "")
+                        if link:
+                            results.append({"title": title, "snippet": snippet, "url": link})
+                    if not results:
+                        logger.warning(f"No valid results found for query: {query}")
+                    return json.dumps(results)
         except Exception as e:
-            logger.error(f"Image search error for query '{query}': {str(e)}")
+            logger.error(f"Web search error for query '{query}': {str(e)}")
             return json.dumps([])
 
     def _run(self, query: str) -> str:
@@ -320,7 +325,7 @@ prompt_template = ChatPromptTemplate.from_messages([
 
 Search policy:
 - Only use external tools for current events, breaking news, live updates, or clearly time-sensitive queries.
-- For queries like "who is [person]", use the web_search tool to gather biographical details and structure them in a Markdown card with fields: **Name**, **Occupation**, **Born**, **Nationality**. Then, use the image_search tool to fetch exactly two images of the person, returning the raw JSON array of image results (with title, url, thumbnail) without modification.
+- For queries like "who is [person]", use the web_search tool to gather biographical details and structure them in a Markdown card with fields: **Name**, **Occupation**, **Born**, **Nationality**. Do NOT use the image_search tool for these queries.
 - For queries requesting images, pictures, or photos, use the image_search tool. **YOU MUST RETURN THE RAW JSON OUTPUT FROM image_search (array or error object) EXACTLY AS RECEIVED, WITHOUT ANY MODIFICATION, REFORMATTING, OR CONVERSION TO MARKDOWN.** Do not add text like "Here are some images" or format results as a list.
 - Do not use external tools for general explanations, definitions, or evergreen topics.
 
@@ -334,7 +339,7 @@ MANDATORY FORMATTING - YOU MUST FOLLOW THESE RULES:
 7. For news, format as cards with image, headline, publication date, and source link.
 8. For image_search, **return only the raw JSON array or error object as-is, with no additional text or formatting.**
 
-Current datetime: 2025-09-09 12:56:00 IST"""),
+Current datetime: 2025-09-09 15:02:00 IST"""),
     MessagesPlaceholder(variable_name="chat_history"),
     ("human", "{input}"),
     MessagesPlaceholder(variable_name="agent_scratchpad")
@@ -373,7 +378,7 @@ Here is some text.
 | Apple  | Red    | Sweet/Tart  |
 | Orange | Orange | Citrusy     |
 
-Current datetime: 2025-09-09 12:56:00 IST"""),
+Current datetime: 2025-09-09 15:02:00 IST"""),
     MessagesPlaceholder(variable_name="chat_history"),
     ("human", "{input}")
 ])
@@ -434,7 +439,7 @@ def normalize_markdown(s: str) -> str:
 def fix_markdown_line(line: str, prev_line: str, next_line: str = '') -> str:
     stripped = line.strip()
     result = line
-    if stripped.startswith('|') or stripped.startswith('- '):
+    if stripped.startswith('|') or stripped.endswith('|'):
         if prev_line.strip() and not prev_line.strip().startswith(('- ', '|')):
             result = '\n' + line
     elif prev_line.strip().startswith(('- ', '|')) and not stripped.startswith(('- ', '|')):
@@ -503,6 +508,8 @@ async def generate_streaming_response(
             active_tools = [image_search_tool]
         elif "news" in message.lower() and not financial_query and news_search_tool:
             active_tools = [news_search_tool]
+        elif _mentions_person(message) and not image_query:
+            active_tools = [tool for tool in tools if tool.name != "image_search"]
 
         agent = create_openai_functions_agent(llm, active_tools, formatted_prompt)
         agent_executor = AgentExecutor(
@@ -588,7 +595,20 @@ Source: [View Original]({url})
         yield f"data: {json.dumps({'token': error_message})}\n\n"
         yield f"data: {json.dumps({'done': True})}\n\n"
 
-# UI
+# Cache clearing endpoint
+@app.post("/clear-cache")
+async def clear_cache():
+    try:
+        # Clear caches for WebSearchTool and ImageSearchTool
+        WebSearchTool._arun.clear_cache()
+        ImageSearchTool._arun.clear_cache()
+        logger.info("Caches cleared for WebSearchTool and ImageSearchTool")
+        return {"status": "success", "message": "Caches cleared successfully"}
+    except Exception as e:
+        logger.error(f"Error clearing cache: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to clear cache: {str(e)}")
+
+# UI (unchanged, included for completeness)
 @app.get("/", response_class=HTMLResponse)
 async def root():
     html_content = r"""
@@ -598,13 +618,10 @@ async def root():
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Cassy – Chat UI</title>
-
-  <!-- Libraries -->
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.5/dist/purify.min.js"></script>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism-tomorrow.min.css" />
   <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js"></script>
-
   <style>
     :root {
       --bg: #0b0f0d;
@@ -942,7 +959,6 @@ async def root():
     </div>
   </main>
 </div>
-
 <script>
 function debounce(func, wait) {
   let timeout;
@@ -951,39 +967,33 @@ function debounce(func, wait) {
     timeout = setTimeout(() => func.apply(this, args), wait);
   };
 }
-
 let sessionId = null;
 let isRecording = false;
 let mediaRecorder = null;
 let audioChunks = [];
 const BASE_URL = window.location.origin;
-
 const messagesDiv = document.getElementById('messages');
 const messageInput = document.getElementById('messageInput');
 const sendButton = document.getElementById('sendButton');
 const micButton = document.getElementById('micButton');
 const welcomeDiv = document.getElementById('welcome');
-
 console.log('Page loaded, elements found:', {
   messagesDiv: !!messagesDiv,
   messageInput: !!messageInput,
   sendButton: !!sendButton,
   micButton: !!micButton
 });
-
 const debouncedRenderMarkdown = debounce((bubble, text) => {
   if (typeof marked === 'undefined' || typeof DOMPurify === 'undefined') {
     console.warn('marked or DOMPurify not available');
     bubble.textContent = text;
     return;
   }
-
   try {
     bubble.classList.add('markdown');
     let processed = text.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, function(_, alt, src) {
       return `<img class="md-img" src="${src}" alt="${alt}" />`;
     });
-
     marked.setOptions({ 
       gfm: true, 
       breaks: true, 
@@ -991,7 +1001,6 @@ const debouncedRenderMarkdown = debounce((bubble, text) => {
       headerIds: false,
       mangle: false
     });
-
     const rawHtml = marked.parse(processed);
     const safeHtml = DOMPurify.sanitize(rawHtml, {
       USE_PROFILES: { html: true },
@@ -1009,9 +1018,7 @@ const debouncedRenderMarkdown = debounce((bubble, text) => {
       ],
       ALLOWED_URI_REGEXP: /^(?:(?:(?:f|ht)tps?|mailto|tel|callto|cid|xmpp|data):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i
     });
-
     bubble.innerHTML = safeHtml;
-
     if (typeof Prism !== 'undefined') {
       try {
         Prism.highlightAllUnder(bubble);
@@ -1019,18 +1026,15 @@ const debouncedRenderMarkdown = debounce((bubble, text) => {
         console.warn('Prism highlight failed:', e);
       }
     }
-
   } catch (e) {
     console.warn('Markdown rendering failed, falling back to plain text:', e);
     bubble.classList.remove('markdown');
     bubble.textContent = text;
   }
 }, 50);
-
 function hideWelcome() {
   if (welcomeDiv) welcomeDiv.style.display = 'none';
 }
-
 function addMessage(text, isUser = false) {
   hideWelcome();
   const row = document.createElement('div');
@@ -1056,7 +1060,6 @@ function addMessage(text, isUser = false) {
   messagesDiv.scrollTop = messagesDiv.scrollHeight;
   return bubble;
 }
-
 function showTyping() {
   const row = document.createElement('div');
   row.className = 'row';
@@ -1072,12 +1075,10 @@ function showTyping() {
   messagesDiv.appendChild(row);
   messagesDiv.scrollTop = messagesDiv.scrollHeight;
 }
-
 function hideTyping() {
   const typing = document.getElementById('typing-indicator');
   if (typing) typing.remove();
 }
-
 async function sendMessage() {
   const message = messageInput.value.trim();
   if (!message) return;
@@ -1136,7 +1137,6 @@ async function sendMessage() {
     sendButton.disabled = false;
   }
 }
-
 async function startRecording() {
   if (!navigator.mediaDevices) { alert('Microphone not available'); return; }
   try {
@@ -1215,7 +1215,6 @@ async function startRecording() {
     alert('Could not access microphone: ' + error.message);
   }
 }
-
 function stopRecording() {
   if (isRecording && mediaRecorder) {
     mediaRecorder.stop();
@@ -1224,7 +1223,6 @@ function stopRecording() {
     micButton.innerHTML = '🎤';
   }
 }
-
 function attachEventListeners() {
   if (sendButton) sendButton.addEventListener('click', function(e) { e.preventDefault(); sendMessage(); });
   if (messageInput) messageInput.addEventListener('keypress', function(e) {
@@ -1234,12 +1232,10 @@ function attachEventListeners() {
     e.preventDefault(); if (isRecording) stopRecording(); else startRecording();
   });
 }
-
 document.addEventListener('DOMContentLoaded', function() {
   attachEventListeners();
   if (messageInput) messageInput.focus();
 });
-
 if (document.readyState !== 'loading') {
   attachEventListeners();
   if (messageInput) messageInput.focus();
@@ -1334,6 +1330,8 @@ async def chat_non_stream(chat_message: ChatMessage):
             active_tools = [image_search_tool]
         elif "news" in message.lower() and not financial_query and news_search_tool:
             active_tools = [news_search_tool]
+        elif _mentions_person(message) and not image_query:
+            active_tools = [tool for tool in tools if tool.name != "image_search"]
 
         agent = create_openai_functions_agent(llm, active_tools, formatted_prompt)
         agent_executor = AgentExecutor(
@@ -1417,3 +1415,4 @@ async def startup_event():
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, log_level="info", access_log=True)
+
