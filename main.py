@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 # Environment variables
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "your-openai-key")
-SERPAPI_KEY = os.getenv("SERPAPI_KEY", "your-serpapi-key")
+SERPAPI_KEY = os.getenv("SERP_API_KEY", "your-serpapi-key")
 GNEWS_API_KEY = os.getenv("GNEWS_API_KEY", "your-gnews-key")
 MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
 PORT = int(os.getenv("PORT", 8000))
@@ -83,21 +83,17 @@ def _is_current_query(t: str) -> bool:
 def _mentions_person(t: str) -> bool:
     return any(re.search(p, t, re.IGNORECASE) for p in PERSON_TRIGGERS)
 
+IMAGE_TRIGGERS = {
+    "image", "images", "picture", "pictures", "photo", "photos", "pic", "pics", "img"
+}
+
+def is_image_query(t: str) -> bool:
+    tl = t.lower()
+    return any(term in tl for term in IMAGE_TRIGGERS)
+
 def should_use_web_search(message: str) -> bool:
-    t = (message or "").strip().lower()
-    if not t:
-        return False
-    if re.search(r"\b(what is|explain|how (does|do)|definition|concept|theory|principle)\b", t, re.IGNORECASE):
-        return False
-    if "news" in t:
-        return True
-    if _is_current_query(t):
-        return True
-    if _mentions_person(t) and _is_current_query(t):
-        return True
-    if re.search(r"\b(price|stock|market cap|release date|version|changelog)\b", t, re.IGNORECASE) and _is_current_query(t):
-        return True
-    return False
+     t = (message or "").strip().lower()
+     return True
 
 # Custom cache for time-sensitive data
 def timed_lru_cache(seconds: int):
@@ -123,48 +119,105 @@ def timed_lru_cache(seconds: int):
 class WebSearchTool(BaseTool):
     name: str = "web_search"
     description: str = "Search the web for current information using SerpAPI. Keep outputs concise."
+    def __hash__(self):
+        return hash(self.name)
+
+    def __eq__(self, other):
+        return isinstance(other, WebSearchTool) and self.name == other.name
 
     @timed_lru_cache(seconds=3600)
     async def _arun(self, query: str) -> str:
         try:
+            if not SERPAPI_KEY or SERPAPI_KEY == "your-serpapi-key":
+                logger.error("Invalid or missing SERPAPI_KEY")
+                return json.dumps([])
+
             async with aiohttp.ClientSession() as session:
                 url = "https://serpapi.com/search"
-                params = {"engine": "google", "q": query, "api_key": SERPAPI_KEY, "num": 5}
+                params = {
+                    "engine": "google",
+                    "q": query,
+                    "tbm": "isch",
+                    "api_key": SERPAPI_KEY,
+                    "num": 6,
+                    "ijn": 0  # Ensure first page of results
+                }
+                logger.info(f"Sending image search request for query: {query}")
                 async with session.get(url, params=params, timeout=10) as response:
+                    if response.status != 200:
+                        logger.error(f"Image search API returned status: {response.status} - {await response.text()}")
+                        return json.dumps([])
                     data = await response.json()
-                    results = []
-                    for result in (data.get("organic_results") or [])[:3]:
-                        title = result.get("title", "")
-                        snippet = result.get("snippet", "")
-                        link = result.get("link", "")
-                        results.append(f"- **{title}** — {snippet}\n  Source: {link}")
-                    return "\n".join(results) if results else "No results found."
+                    logger.debug(f"SerpAPI response: {json.dumps(data)[:500]}...")
+                    images = []
+                    for img in (data.get("images_results") or [])[:3]:
+                        title = img.get("title", "Untitled Image")
+                        original = img.get("original", "")
+                        thumbnail = img.get("thumbnail", original)  # Fallback to original if no thumbnail
+                        if original:
+                            images.append({"title": title, "url": original, "thumbnail": thumbnail})
+                    if not images:
+                        logger.warning(f"No valid images found for query: {query}")
+                    return json.dumps(images)
         except Exception as e:
-            logger.error(f"Web search error: {e}")
-            return f"Search error: {str(e)}"
+            logger.error(f"Image search error for query '{query}': {str(e)}")
+            return json.dumps([])
 
     def _run(self, query: str) -> str:
         return asyncio.run(self._arun(query))
 
 class ImageSearchTool(BaseTool):
     name: str = "image_search"
-    description: str = "Search for images using SerpAPI. Returns a small JSON array."
+    description: str = "Search for images using SerpAPI. Returns a JSON array of image results with title, url, and thumbnail, or an error object."
+    def __hash__(self):
+        return hash(self.name)
+
+    def __eq__(self, other):
+        return isinstance(other, ImageSearchTool) and self.name == other.name
 
     @timed_lru_cache(seconds=3600)
     async def _arun(self, query: str) -> str:
         try:
+            if not SERPAPI_KEY or SERPAPI_KEY == "your-serpapi-key":
+                logger.error("Invalid or missing SERPAPI_KEY")
+                return json.dumps({"error": "Invalid or missing SerpAPI key. Please configure a valid key."})
+
             async with aiohttp.ClientSession() as session:
                 url = "https://serpapi.com/search"
-                params = {"engine": "google", "q": query, "tbm": "isch", "api_key": SERPAPI_KEY, "num": 6}
+                params = {
+                    "engine": "google",
+                    "q": query,
+                    "tbm": "isch",
+                    "api_key": SERPAPI_KEY,
+                    "num": 6,
+                    "ijn": 0
+                }
+                logger.info(f"Sending image search request for query: {query}")
                 async with session.get(url, params=params, timeout=10) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        logger.error(f"Image search API returned status: {response.status} - {error_text}")
+                        if response.status == 401:
+                            return json.dumps({"error": "Invalid SerpAPI key. Please check your API key."})
+                        elif response.status == 429:
+                            return json.dumps({"error": "SerpAPI rate limit exceeded. Please try again later."})
+                        return json.dumps({"error": f"Image search API error: HTTP {response.status}"})
                     data = await response.json()
+                    logger.debug(f"SerpAPI response: {json.dumps(data)[:500]}...")
+                    if "error" in data:
+                        logger.error(f"SerpAPI returned error: {data['error']}")
+                        return json.dumps({"error": f"SerpAPI error: {data['error']}"})
                     images = []
-                    for img in (data.get("images_results") or [])[:2]:
-                        images.append({"title": img.get("title", ""), "url": img.get("original", ""), "thumbnail": img.get("thumbnail", "")})
-                    return json.dumps(images) if images else "No images found"
+                    for img in (data.get("images_results") or [])[:3]:
+                        title = img.get("title", "Untitled Image")
+                        original = img.get("original", "")
+                        thumbnail = img.get("thumbnail", original)
+                        if original:
+                            images.append({"title": title, "url": original, "thumbnail": thumbnail})
+                    return json.dumps(images)
         except Exception as e:
-            logger.error(f"Image search error: {e}")
-            return f"Image search error: {str(e)}"
+            logger.error(f"Image search error for query '{query}': {str(e)}")
+            return json.dumps({"error": f"Image search failed: {str(e)}"})
 
     def _run(self, query: str) -> str:
         return asyncio.run(self._arun(query))
@@ -266,11 +319,10 @@ prompt_template = ChatPromptTemplate.from_messages([
     ("system", """You are cassy, a concise, friendly, expert AI assistant.
 
 Search policy:
-- Only use external tools for current events, images, breaking news, live updates, or clearly time-sensitive queries.
-- For news queries, use the news_search tool to generate formatted news cards with images and headlines.
+- Only use external tools for current events, breaking news, live updates, or clearly time-sensitive queries.
+- For queries like "who is [person]", use the web_search tool to gather biographical details and structure them in a Markdown card with fields: **Name**, **Occupation**, **Born**, **Nationality**. Then, use the image_search tool to fetch exactly two images of the person, returning the raw JSON array of image results (with title, url, thumbnail) without modification.
+- For queries requesting images, pictures, or photos, use the image_search tool. **YOU MUST RETURN THE RAW JSON OUTPUT FROM image_search (array or error object) EXACTLY AS RECEIVED, WITHOUT ANY MODIFICATION, REFORMATTING, OR CONVERSION TO MARKDOWN.** Do not add text like "Here are some images" or format results as a list.
 - Do not use external tools for general explanations, definitions, or evergreen topics.
-- For image queries, always use the image_search tool.
-
 
 MANDATORY FORMATTING - YOU MUST FOLLOW THESE RULES:
 1. ALWAYS add blank lines before and after tables.
@@ -280,34 +332,9 @@ MANDATORY FORMATTING - YOU MUST FOLLOW THESE RULES:
 5. For tables, ensure headers are separated by a row of `|---|` and columns are aligned.
 6. For lists, use `-` for each item, one per line, with no inline lists.
 7. For news, format as cards with image, headline, publication date, and source link.
+8. For image_search, **return only the raw JSON array or error object as-is, with no additional text or formatting.**
 
-Example of CORRECT formatting:
-
-Here is some text.
-
-**Fruit List:**
-
-- Apple
-- Banana
-- Orange
-
-**Comparison Table:**
-
-| Fruit  | Color  | Taste       |
-|--------|--------|-------------|
-| Apple  | Red    | Sweet/Tart  |
-| Orange | Orange | Citrusy     |
-
-**News Card:**
-
-**Example News Title**
-
-![News Image](https://example.com/image.jpg)
-
-Published: 2025-09-08
-Source: [Example Source](https://example.com)
-
-Current datetime: {datetime}"""),
+Current datetime: 2025-09-09 12:56:00 IST"""),
     MessagesPlaceholder(variable_name="chat_history"),
     ("human", "{input}"),
     MessagesPlaceholder(variable_name="agent_scratchpad")
@@ -317,10 +344,8 @@ simple_prompt_template = ChatPromptTemplate.from_messages([
     ("system", """You are cassy, a concise, friendly, expert AI assistant.
 
 Search policy:
-- Only use external tools for current events, images, breaking news, live updates, or clearly time-sensitive queries.
+- Only use external tools for current events, breaking news, live updates, or clearly time-sensitive queries.
 - Do not use external tools for general explanations, definitions, or evergreen topics.
-- For image queries, always use the image_search tool.
-
 
 MANDATORY FORMATTING - YOU MUST FOLLOW THESE RULES:
 1. ALWAYS add blank lines before and after tables.
@@ -329,6 +354,7 @@ MANDATORY FORMATTING - YOU MUST FOLLOW THESE RULES:
 4. Use proper Markdown syntax for tables and lists.
 5. For tables, ensure headers are separated by a row of `|---|` and columns are aligned.
 6. For lists, use `-` for each item, one per line, with no inline lists.
+7. For image_search, **do not format the output; return the raw JSON array or error object as-is.**
 
 Example of CORRECT formatting:
 
@@ -347,7 +373,7 @@ Here is some text.
 | Apple  | Red    | Sweet/Tart  |
 | Orange | Orange | Citrusy     |
 
-Current datetime: {datetime}"""),
+Current datetime: 2025-09-09 12:56:00 IST"""),
     MessagesPlaceholder(variable_name="chat_history"),
     ("human", "{input}")
 ])
@@ -458,10 +484,26 @@ async def generate_streaming_response(
             yield f"data: {json.dumps({'done': True})}\n\n"
             return
 
+        if message.lower().strip() in ["images", "pictures", "photos", "give some images", "show images", "tell images"]:
+            response_text = "Could you specify what images you want (e.g., 'images of the Eiffel Tower' or 'pictures of cats')?"
+            await save_conversation(session_id, message, response_text)
+            yield f"data: {json.dumps({'token': response_text + '\n'})}\n\n"
+            yield f"data: {json.dumps({'done': True})}\n\n"
+            return
+
         current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         formatted_prompt = prompt_template.partial(datetime=current_time)
+        financial_query = re.search(r"\b(stock|price|sensex|nifty|market)\b", message.lower())
         news_search_tool = next((tool for tool in tools if tool.name == "news_search"), None)
-        active_tools = [news_search_tool] if "news" in message.lower() and news_search_tool else tools
+        image_search_tool = next((tool for tool in tools if tool.name == "image_search"), None)
+        image_query = is_image_query(message)
+
+        active_tools = tools
+        if image_query and image_search_tool:
+            active_tools = [image_search_tool]
+        elif "news" in message.lower() and not financial_query and news_search_tool:
+            active_tools = [news_search_tool]
+
         agent = create_openai_functions_agent(llm, active_tools, formatted_prompt)
         agent_executor = AgentExecutor(
             agent=agent,
@@ -469,18 +511,52 @@ async def generate_streaming_response(
             memory=memory,
             verbose=True,
             handle_parsing_errors=True,
-            max_execution_time=20,  # Increased to 20 seconds
-            max_iterations=5        # Increased to 5 iterations
+            max_execution_time=20,
+            max_iterations=5
         )
 
         yield f"data: {json.dumps({'token': '🔎 Searching...\n\n'})}\n\n"
 
         try:
+            logger.info(f"Invoking agent with input: {message}, active tools: {[tool.name for tool in active_tools]}")
             result = await agent_executor.ainvoke({"input": message})
-            response_text = normalize_markdown(result.get("output", ""))
+            response_text = result.get("output", "")
+
+            # Handle image search results
+            if image_query and response_text:
+                try:
+                    images = json.loads(response_text)
+                    if isinstance(images, dict) and "error" in images:
+                        logger.error(f"Image search tool returned error: {images['error']}")
+                        response_text = f"Failed to fetch images for '{message}': {images['error']}. Please try again later or check your API configuration."
+                    elif isinstance(images, list):
+                        cards = []
+                        for img in images:
+                            title = img.get("title", "Untitled Image")
+                            thumbnail = img.get("thumbnail", img.get("url", ""))
+                            url = img.get("url", "")
+                            if url:
+                                card = f"""
+**{title}**
+
+![Image]({thumbnail})
+
+Source: [View Original]({url})
+"""
+                                cards.append(card.strip())
+                        response_text = "\n\n---\n\n".join(cards) if cards else f"No images found for '{message}'. Try a more specific query (e.g., 'images of {message.replace('images of ', '').replace('photos of ', '')} at an event') or check sites like Getty Images."
+                    else:
+                        logger.warning(f"Unexpected image search result format: {response_text}")
+                        response_text = f"No images found for '{message}'. Try a more specific query (e.g., 'images of {message.replace('images of ', '').replace('photos of ', '')} at an event') or check sites like Getty Images."
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse image_search JSON: {response_text}, error: {str(e)}")
+                    response_text = f"No images found for '{message}'. Try a more specific query (e.g., 'images of {message.replace('images of ', '').replace('photos of ', '')} at an event') or check sites like Getty Images."
+            response_text = normalize_markdown(response_text)
         except Exception as e:
             logger.error(f"Agent execution error: {e}")
-            if "news" in message.lower():
+            if image_query:
+                response_text = f"No images found for '{message}'. Try a more specific query (e.g., 'images of {message.replace('images of ', '').replace('photos of ', '')} at an event') or check sites like Getty Images."
+            elif "news" in message.lower():
                 response_text = """
 **Recent News Fallback:**
 
@@ -488,6 +564,7 @@ async def generate_streaming_response(
 """
             else:
                 response_text = f"Error fetching results: {str(e)}. Please try again or rephrase your query."
+            response_text = normalize_markdown(response_text)
             yield f"data: {json.dumps({'token': response_text + '\n'})}\n\n"
             yield f"data: {json.dumps({'done': True})}\n\n"
             await save_conversation(session_id, message, response_text)
@@ -1248,7 +1325,16 @@ async def chat_non_stream(chat_message: ChatMessage):
             return SessionResponse(session_id=session_id, message=response_text)
 
         news_search_tool = next((tool for tool in tools if tool.name == "news_search"), None)
-        active_tools = [news_search_tool] if "news" in message.lower() and news_search_tool else tools
+        image_search_tool = next((tool for tool in tools if tool.name == "image_search"), None)
+        image_query = is_image_query(message)
+        financial_query = re.search(r"\b(stock|price|sensex|nifty|market)\b", message.lower())
+
+        active_tools = tools
+        if image_query and image_search_tool:
+            active_tools = [image_search_tool]
+        elif "news" in message.lower() and not financial_query and news_search_tool:
+            active_tools = [news_search_tool]
+
         agent = create_openai_functions_agent(llm, active_tools, formatted_prompt)
         agent_executor = AgentExecutor(
             agent=agent,
@@ -1256,12 +1342,58 @@ async def chat_non_stream(chat_message: ChatMessage):
             memory=memory,
             verbose=True,
             handle_parsing_errors=True,
-            max_execution_time=20,  # Increased to 20 seconds
-            max_iterations=5        # Increased to 5 iterations
+            max_execution_time=20,
+            max_iterations=5
         )
 
-        result = await agent_executor.ainvoke({"input": message})
-        response_text = normalize_markdown(result.get("output", ""))
+        try:
+            result = await agent_executor.ainvoke({"input": message})
+            response_text = result.get("output", "")
+
+            # Handle image search results
+            if image_query and response_text:
+                try:
+                    images = json.loads(response_text)
+                    if isinstance(images, dict) and "error" in images:
+                        logger.error(f"Image search tool returned error: {images['error']}")
+                        response_text = f"Failed to fetch images for '{message}': {images['error']}. Please try again later or check your API configuration."
+                    elif isinstance(images, list):
+                        cards = []
+                        for img in images:
+                            title = img.get("title", "Untitled Image")
+                            thumbnail = img.get("thumbnail", img.get("url", ""))
+                            url = img.get("url", "")
+                            if url:
+                                card = f"""
+**{title}**
+
+![Image]({thumbnail})
+
+Source: [View Original]({url})
+"""
+                                cards.append(card.strip())
+                        response_text = "\n\n---\n\n".join(cards) if cards else f"No images found for '{message}'. Try a more specific query (e.g., 'images of {message.replace('images of ', '').replace('photos of ', '')} at an event') or check sites like Getty Images."
+                    else:
+                        logger.warning(f"Unexpected image search result format: {response_text}")
+                        response_text = f"No images found for '{message}'. Try a more specific query (e.g., 'images of {message.replace('images of ', '').replace('photos of ', '')} at an event') or check sites like Getty Images."
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse image_search JSON: {response_text}, error: {str(e)}")
+                    response_text = f"No images found for '{message}'. Try a more specific query (e.g., 'images of {message.replace('images of ', '').replace('photos of ', '')} at an event') or check sites like Getty Images."
+            response_text = normalize_markdown(response_text)
+        except Exception as e:
+            logger.error(f"Agent execution error: {e}")
+            if image_query:
+                response_text = f"No images found for '{message}'. Try a more specific query (e.g., 'images of {message.replace('images of ', '').replace('photos of ', '')} at an event') or check sites like Getty Images."
+            elif "news" in message.lower():
+                response_text = """
+**Recent News Fallback:**
+
+- **Korea News**: Unable to fetch live news due to technical issues. Try specifying a topic like 'Korea politics news' or check sources like The Korea Herald (https://www.koreaherald.com) for updates.
+"""
+            else:
+                response_text = f"Error fetching results: {str(e)}. Please try again or rephrase your query."
+            response_text = normalize_markdown(response_text)
+
         await save_conversation(session_id, message, response_text)
         return SessionResponse(session_id=session_id, message=response_text)
 
@@ -1285,5 +1417,3 @@ async def startup_event():
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, log_level="info", access_log=True)
-
-
