@@ -266,9 +266,10 @@ prompt_template = ChatPromptTemplate.from_messages([
     ("system", """You are cassy, a concise, friendly, expert AI assistant.
 
 Search policy:
-- Only use external tools for current events, breaking news, live updates, or clearly time-sensitive queries.
+- Only use external tools for current events, images, breaking news, live updates, or clearly time-sensitive queries.
 - For news queries, use the news_search tool to generate formatted news cards with images and headlines.
 - Do not use external tools for general explanations, definitions, or evergreen topics.
+- For Images use web_search tool.
 
 MANDATORY FORMATTING - YOU MUST FOLLOW THESE RULES:
 1. ALWAYS add blank lines before and after tables.
@@ -315,8 +316,9 @@ simple_prompt_template = ChatPromptTemplate.from_messages([
     ("system", """You are cassy, a concise, friendly, expert AI assistant.
 
 Search policy:
-- Only use external tools for current events, breaking news, live updates, or clearly time-sensitive queries.
+- Only use external tools for current events, images, breaking news, live updates, or clearly time-sensitive queries.
 - Do not use external tools for general explanations, definitions, or evergreen topics.
+- For images use web_search tool.
 
 MANDATORY FORMATTING - YOU MUST FOLLOW THESE RULES:
 1. ALWAYS add blank lines before and after tables.
@@ -1281,3 +1283,4 @@ async def startup_event():
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, log_level="info", access_log=True)
+
